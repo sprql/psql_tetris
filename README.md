@@ -42,7 +42,7 @@ Add `:psql_tetris` to `deps/0` in your project's `mix.exs`:
 ```elixir
 def deps do
   [
-    {:psql_tetris, "~> 0.1.2", only: [:dev], runtime: false}
+    {:psql_tetris, "~> 0.1.3", only: [:dev], runtime: false}
   ]
 end
 ```

@@ -101,6 +101,39 @@ defmodule PsqlTetrisTest do
 
       assert Enum.map(Optimizer.optimize(cols), & &1.name) == [:a, :b, :c]
     end
+
+    test "keeps explicit primary keys before alignment-optimized columns" do
+      cols = [
+        %{name: :id, type: :uuid, opts: [primary_key: true]},
+        %{name: :inserted_at, type: :utc_datetime, opts: [null: false]},
+        %{name: :big, type: :bigint, opts: []}
+      ]
+
+      assert Enum.map(Optimizer.optimize(cols), & &1.name) == [:id, :inserted_at, :big]
+    end
+
+    test "non-primary UUIDs still rank normally" do
+      cols = [
+        %{name: :external_id, type: :uuid, opts: []},
+        %{name: :inserted_at, type: :utc_datetime, opts: [null: false]}
+      ]
+
+      assert Enum.map(Optimizer.optimize(cols), & &1.name) == [:inserted_at, :external_id]
+    end
+
+    test "multiple explicit primary keys preserve author order before other columns" do
+      cols = [
+        %{name: :tenant_id, type: :uuid, opts: [primary_key: true]},
+        %{name: :account_id, type: :bigint, opts: [primary_key: true]},
+        %{name: :inserted_at, type: :utc_datetime, opts: [null: false]}
+      ]
+
+      assert Enum.map(Optimizer.optimize(cols), & &1.name) == [
+               :tenant_id,
+               :account_id,
+               :inserted_at
+             ]
+    end
   end
 
   describe "MigrationRewriter.rewrite/1" do

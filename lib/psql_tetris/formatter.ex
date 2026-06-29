@@ -2,7 +2,7 @@ defmodule PsqlTetris.Formatter do
   @moduledoc """
   Mix formatter plugin.
 
-  Add this module to the `:plugins` list of your project's `.formatter.exs` and `mix format` will quietly reorder columns in new (and existing) Ecto migrations for optimal PostgreSQL column alignment:
+  Add this module to the `:plugins` list of your project's `.formatter.exs` and `mix format` will quietly reorder columns in new (and existing) Ecto migrations using PostgreSQL layout metadata:
 
       # .formatter.exs
       [
@@ -26,6 +26,16 @@ defmodule PsqlTetris.Formatter do
       psql_tetris: [enabled: true | false]
 
   in `.formatter.exs`.
+
+  Unknown/custom migration types default to conservative varlena layout. If your project uses custom PostgreSQL enums for otherwise-unknown atoms, configure their physical layout globally:
+
+      psql_tetris: [unknown_type_layout: {:fixed, 4, 4}]
+
+  Blank lines split reorderable column runs by default. If your migrations use
+  blank lines as visual spacing rather than semantic grouping, ignore and remove
+  them inside reorderable runs instead:
+
+      psql_tetris: [blank_lines: :ignore]
   """
 
   @behaviour Mix.Tasks.Format
@@ -42,7 +52,7 @@ defmodule PsqlTetris.Formatter do
     file = Keyword.get(opts, :file, "")
 
     if enabled?(opts) and migration_file?(file, opts) do
-      MigrationRewriter.rewrite(contents)
+      MigrationRewriter.rewrite(contents, config(opts))
     else
       contents
     end
@@ -57,10 +67,11 @@ defmodule PsqlTetris.Formatter do
 
   defp postgres_project?, do: Code.ensure_loaded?(Postgrex)
 
+  defp config(opts), do: Keyword.get(opts, :psql_tetris, [])
+
   @doc false
   def migration_file?(file, opts) when is_binary(file) do
-    cfg = Keyword.get(opts, :psql_tetris, [])
-    paths = Keyword.get(cfg, :migration_paths, default_paths())
+    paths = opts |> config() |> Keyword.get(:migration_paths, default_paths())
 
     Enum.any?(paths, fn pattern ->
       if String.contains?(pattern, "*") do

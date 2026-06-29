@@ -6,7 +6,7 @@
 [![HexDocs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/psql_tetris)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Mix formatter plugin that reorders columns in **Ecto migrations** for optimal PostgreSQL column alignment: less padding between values, fewer wasted bytes per row, smaller tables on big writes.
+A Mix formatter plugin that reorders columns in **Ecto migrations** using PostgreSQL layout metadata and a fixed-width-first layout heuristic: less padding between fixed-width values, fewer wasted bytes per row, smaller tables on big writes.
 
 Full docs: <https://hexdocs.pm/psql_tetris>.
 
@@ -20,7 +20,7 @@ PostgreSQL aligns each column value to a natural boundary on disk (8-byte values
 boolean, text, bigint, smallint, integer
 ```
 
-can waste several bytes per row on padding. The same columns reordered largest-alignment-first leave no holes.
+can waste several bytes per row on padding. The same fixed-width columns reordered largest-alignment-first reduce those holes. Variable-length columns such as `text`/`jsonb` are handled conservatively as a tail because their exact inline size is data-dependent.
 
 ## Only runs on PostgreSQL projects
 
@@ -42,7 +42,7 @@ Add `:psql_tetris` to `deps/0` in your project's `mix.exs`:
 ```elixir
 def deps do
   [
-    {:psql_tetris, "~> 0.1.3", only: [:dev], runtime: false}
+    {:psql_tetris, "~> 0.2.0", only: [:dev], runtime: false}
   ]
 end
 ```
@@ -58,11 +58,17 @@ Where the plugin goes depends on your project layout.
 [
   import_deps: [:ecto_sql],
   plugins: [PsqlTetris.Formatter],
-  inputs: ["*.exs"]
+  inputs: ["*.exs"],
+  psql_tetris: [
+    # optional project-specific settings go here
+    # unknown_type_layout: {:fixed, 4, 4}
+  ]
 ]
 ```
 
-You do **not** need to add anything to the root `.formatter.exs`. The default Phoenix root `inputs:` doesn't cover migrations anyway, so a `plugins:` entry there would never fire on a migration.
+Put `psql_tetris:` options in the same `.formatter.exs` that contains `plugins: [PsqlTetris.Formatter]`. In a standard Phoenix project, that means `priv/repo/migrations/.formatter.exs`, not the root formatter config. For files under a formatter `subdirectories:` entry, Mix uses the subdirectory config only; root-level plugin options are not applied to those files.
+
+You do **not** need to add anything to the root `.formatter.exs` unless your root formatter is the one that actually formats migration files. The default Phoenix root `inputs:` doesn't cover migrations anyway, so a `plugins:` entry there would never fire on a migration.
 
 ### Non-Phoenix projects (no migrations subdirectory)
 
@@ -71,7 +77,11 @@ If your project keeps everything under a single `.formatter.exs` (no `subdirecto
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test,priv}/**/*.{ex,exs}"],
-  plugins: [PsqlTetris.Formatter]
+  plugins: [PsqlTetris.Formatter],
+  psql_tetris: [
+    # optional project-specific settings go here
+    # unknown_type_layout: {:fixed, 4, 4}
+  ]
 ]
 ```
 
@@ -84,6 +94,35 @@ psql_tetris: [
   migration_paths: ["priv/repo/migrations/", "apps/*/priv/repo/migrations/"]
 ]
 ```
+
+### Unknown custom types
+
+Built-in Ecto/PostgreSQL types are recognized automatically. Project-specific atoms are ambiguous when formatting offline:
+
+```elixir
+add(:role, :user_role, null: false)
+add(:subject_type, :message_subject_type, null: false)
+```
+
+By default, unknown/custom atoms use conservative varlena layout. That is safest for domains, extensions, composite/custom types, and anything whose physical storage is not known to the formatter.
+
+If your project's otherwise-unknown migration atoms are PostgreSQL enums, configure their fixed 4-byte layout globally in the formatter config that formats migrations:
+
+```elixir
+# priv/repo/migrations/.formatter.exs in standard Phoenix projects
+[
+  import_deps: [:ecto_sql],
+  plugins: [PsqlTetris.Formatter],
+  inputs: ["*.exs"],
+  psql_tetris: [
+    unknown_type_layout: {:fixed, 4, 4}
+  ]
+]
+```
+
+For single-formatter projects, put the same `psql_tetris:` block in the root `.formatter.exs` instead.
+
+PostgreSQL enums are fixed-width 4-byte values with 4-byte alignment, represented as `{:fixed, 4, 4}`. This can avoid noisy or suboptimal ordering for enum-heavy schemas, while preserving the conservative default for projects with mixed custom types.
 
 ## What it does
 
@@ -116,7 +155,8 @@ Within an alignment group, `null: false` columns come first (a small CPU win dur
 ## Rules
 
 * Only `add/2,3` calls inside `create table` and `alter table` blocks are touched.
-* `modify/3`, `remove/2`, `timestamps/0`, comments, and blank lines act as **barriers**: they are never moved, and they split surrounding `add` runs into independent groups. This preserves intentional grouping by the author.
+* `modify/3`, `remove/2`, comments, and blank lines act as **barriers** by default: they are never moved, and they split surrounding column runs into independent groups. This preserves intentional grouping by the author.
+* `timestamps/0,1` is reordered with `add/2,3` calls. If you use blank lines as visual spacing rather than semantic grouping, configure `psql_tetris: [blank_lines: :ignore]` to let sortable columns cross blank lines and remove those blanks from the reordered run.
 * Files that don't look like migrations (per `migration_paths`) are passed through unchanged.
 
 ## Opting out per block
@@ -138,24 +178,37 @@ The opt-out-via-comment idea is borrowed from Angelika Cathor's [Markdown code-b
 
 [angelika]: https://angelika.me/2024/01/27/format-elixir-code-blocks-in-markdown/
 
-## How types are classified
+## PostgreSQL layout model
 
-`PsqlTetris` uses a two-layer strategy so it stays accurate without duplicating logic from Ecto:
+`PsqlTetris` models column layout from PostgreSQL physical storage metadata. Internally it keeps only the facts needed for ordering:
 
-1. **Delegate to Ecto when available.** If `Ecto.Adapters.Postgres.Connection` is loaded (always true inside a Phoenix/Ecto project), we ask Ecto itself to render the PG column type via `column_type/2`, then look up the resulting PG type name (`bigint`, `timestamp`, `uuid`, ...) in the PostgreSQL catalog alignment table. This way we always match whatever Ecto version your project happens to use, with no duplicated mapping for us to keep in sync.
-2. **Static fallback** when Ecto isn't loaded (running stand-alone). Mirrors Ecto's documented mapping for the common types.
+| Field | Meaning |
+|-------|---------|
+| `kind` | `:fixed` for fixed-width values, `:varlena` for variable-length values |
+| `width` | Fixed byte width, or `nil` for varlena values |
+| `align_bytes` | Required byte alignment: 8, 4, 2, or 1 |
 
-Either path returns a rank 1-5:
+This distinction matters because common varlena types are still 4-byte aligned:
 
-| Rank | PG alignment    | Examples (PG types)                                  |
-|------|-----------------|------------------------------------------------------|
-| 1    | 8-byte fixed    | `bigint`, `bigserial`, `timestamp[tz]`, `float8`, `interval`, `money` |
-| 2    | 4-byte fixed    | `integer`, `serial`, `date`, `time`, `real`, `uuid`  |
-| 3    | 2-byte fixed    | `smallint`, `smallserial`                            |
-| 4    | 1-byte fixed    | `boolean`, `"char"`                                  |
-| 5    | variable length | `text`, `varchar`, `numeric`, `jsonb`, `bytea`, arrays |
+| PG type | `kind` | `width` | `align_bytes` |
+|---------|--------|---------|---------------|
+| `bool` | `:fixed` | `1` | `1` |
+| `int8` | `:fixed` | `8` | `8` |
+| `int4` | `:fixed` | `4` | `4` |
+| `text` | `:varlena` | `nil` | `4` |
+| `jsonb` | `:varlena` | `nil` | `4` |
+| `numeric` | `:varlena` | `nil` | `4` |
 
-Unknown types fall back to rank 5 (varlena), which is the safe end of the table.
+The default ordering policy is conservative:
+
+1. explicit primary keys first;
+2. fixed-width columns by descending physical alignment/width;
+3. variable-length columns in a conservative tail;
+4. references stay high when doing so is padding-equivalent;
+5. unknown/custom types as inferred varlena, 4-byte aligned, unless `unknown_type_layout: {:fixed, width, align_bytes}` is configured;
+6. `null: false` only as a tie-breaker inside equivalent physical buckets.
+
+Varlena ordering is necessarily heuristic because the exact inline size of a `text`, `jsonb`, `numeric`, etc. value is row-dependent. The formatter is pure/offline: it uses static metadata for built-in/common types and does not query your database during `mix format`.
 
 > **Note:** `ecto_sql` is **not** declared as a runtime dep of `psql_tetris`, so adding the plugin never forces a particular Ecto version on you. Detection is purely at call time via `Code.ensure_loaded?/1`.
 
@@ -163,6 +216,12 @@ Unknown types fall back to rank 5 (varlena), which is the safe end of the table.
 
 ```elixir
 PsqlTetris.optimize_migration(File.read!("priv/repo/migrations/..."))
+```
+
+Pass formatter options directly when calling programmatically:
+
+```elixir
+PsqlTetris.optimize_migration(source, unknown_type_layout: {:fixed, 4, 4})
 ```
 
 ## License

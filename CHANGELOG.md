@@ -4,6 +4,15 @@ All notable changes to `psql_tetris` are documented in this file. Format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-28
+
+### Changed
+
+* Simplified layout resolution to deterministic static metadata exposed through
+  `PsqlTetris.Layout.resolve/2`.
+* Removed the dynamic Ecto Postgres type-rendering path and the legacy
+  `from_pg_type/1` and `inferred_varlena/0` layout APIs.
+
 ## [0.1.3] - 2026-06-25
 
 ### Changed
@@ -47,8 +56,8 @@ Initial release.
   `add/2,3` calls inside `create table` and `alter table` blocks. Other
   statements (`modify`, `remove`, `timestamps`, comments, blank lines)
   act as semantic barriers.
-* `PsqlTetris.Optimizer`: Pure stable sort by alignment rank, with
-  `null: false` columns prioritized within each rank.
+* `PsqlTetris.Column`: Source-preserving column representation with stable
+  sort by physical layout and `null: false` tie-breaking.
 * Per-block opt-out via `# psql_tetris: skip` comment.
 * PostgreSQL-only safety gate: detects the host project's database engine
   through the presence of the `Postgrex` driver module and refuses to
@@ -57,6 +66,7 @@ Initial release.
   * `migration_paths` (glob list, default `["priv/repo/migrations/", "/migrations/"]`).
   * `enabled` (`true | false`, default: auto-detect via `Postgrex`).
 
+[0.2.0]: https://github.com/florinpatrascu/psql_tetris/releases/tag/v0.2.0
 [0.1.3]: https://github.com/florinpatrascu/psql_tetris/releases/tag/v0.1.3
 [0.1.2]: https://github.com/florinpatrascu/psql_tetris/releases/tag/v0.1.2
 [0.1.1]: https://github.com/florinpatrascu/psql_tetris/releases/tag/v0.1.1

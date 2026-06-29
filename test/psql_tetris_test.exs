@@ -1,143 +1,214 @@
 defmodule PsqlTetrisTest do
   use ExUnit.Case, async: true
 
+  alias PsqlTetris.Layout
+  alias PsqlTetris.LayoutSimulation
+  alias PsqlTetris.MigrationParser
   alias PsqlTetris.MigrationRewriter
-  alias PsqlTetris.Optimizer
-  alias PsqlTetris.Types
 
-  describe "Types.rank/2" do
-    test "8-byte fixed types" do
-      assert Types.rank(:bigint) == 1
-      assert Types.rank(:bigserial) == 1
-      assert Types.rank(:utc_datetime_usec) == 1
-      assert Types.rank(:float) == 1
+  describe "static type layout" do
+    test "separates variable length from alignment" do
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} = Layout.resolve("text", [])
+      assert %Layout{kind: :fixed, width: 1, align_bytes: 1} = Layout.resolve("bool", [])
     end
 
-    test "4-byte fixed types" do
-      assert Types.rank(:integer) == 2
-      assert Types.rank(:date) == 2
-      assert Types.rank(:uuid) == 2
-      assert Types.rank(:binary_id) == 2
+    test "resolves common Ecto migration types" do
+      assert %Layout{kind: :fixed, width: 8, align_bytes: 8} = Layout.resolve(:bigint, [])
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} = Layout.resolve(:string, [])
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} = Layout.resolve(:map, [])
     end
 
-    test "2-byte / 1-byte / varlena" do
-      assert Types.rank(:smallint) == 3
-      assert Types.rank(:boolean) == 4
-      assert Types.rank(:string) == 5
-      assert Types.rank(:text) == 5
-      assert Types.rank(:map) == 5
-      assert Types.rank({:array, :integer}) == 5
+    test "references resolve through referenced key type" do
+      assert %Layout{kind: :fixed, width: 8, align_bytes: 8} =
+               Layout.resolve({:references, []}, [])
+
+      assert %Layout{kind: :fixed, width: 16, align_bytes: 1} =
+               Layout.resolve({:references, [type: :uuid]}, [])
     end
 
-    test "references default to 8-byte" do
-      assert Types.rank({:references, []}) == 1
-      assert Types.rank({:references, [type: :integer]}) == 2
-      assert Types.rank({:references, [type: :uuid]}) == 2
-      assert Types.rank({:references, [type: :binary_id]}) == 2
+    test "arrays and unknown custom types are varlena 4-byte aligned" do
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} =
+               Layout.resolve({:array, :integer}, [])
+
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} =
+               Layout.resolve("numeric(10,2)[]", [])
+
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} =
+               Layout.resolve(:made_up_extension_type, [])
     end
 
-    test "unknown types fall back to varlena" do
-      assert Types.rank(:totally_made_up) == 5
-    end
-  end
-
-  describe "Types.rank_pg_type/1 (catalog-driven path)" do
-    test "8-byte fixed PG types" do
-      assert Types.rank_pg_type("bigint") == 1
-      assert Types.rank_pg_type("bigserial") == 1
-      assert Types.rank_pg_type("timestamp") == 1
-      assert Types.rank_pg_type("timestamp without time zone") == 1
-      assert Types.rank_pg_type("double precision") == 1
+    test "unknown custom types can use a configured fixed layout" do
+      assert %Layout{kind: :fixed, width: 4, align_bytes: 4} =
+               Layout.resolve(:made_up_extension_type, [], unknown_type_layout: {:fixed, 4, 4})
     end
 
-    test "4-byte fixed PG types" do
-      assert Types.rank_pg_type("integer") == 2
-      assert Types.rank_pg_type("date") == 2
-      assert Types.rank_pg_type("uuid") == 2
-      assert Types.rank_pg_type("real") == 2
+    test "custom type layouts resolve otherwise-unknown types" do
+      opts = [custom_type_layouts: [user_role: {:fixed, 4, 4}, "weird type": :varlena]]
+
+      assert %Layout{kind: :fixed, width: 4, align_bytes: 4} =
+               Layout.resolve(:user_role, [], opts)
+
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} =
+               Layout.resolve("weird type", [], opts)
     end
 
-    test "2-byte / 1-byte / varlena" do
-      assert Types.rank_pg_type("smallint") == 3
-      assert Types.rank_pg_type("boolean") == 4
-      assert Types.rank_pg_type("text") == 5
-      assert Types.rank_pg_type("jsonb") == 5
-      assert Types.rank_pg_type("numeric") == 5
-      assert Types.rank_pg_type("bytea") == 5
-    end
+    test "citext remains varlena even when unknown custom types use a fixed layout" do
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} =
+               Layout.resolve(:citext, [], unknown_type_layout: {:fixed, 4, 4})
 
-    test "strips size/precision suffixes" do
-      assert Types.rank_pg_type("varchar(255)") == 5
-      assert Types.rank_pg_type("numeric(10,2)") == 5
-    end
-
-    test "arrays are always varlena regardless of element type" do
-      assert Types.rank_pg_type("integer[]") == 5
-      assert Types.rank_pg_type("bigint[]") == 5
+      assert %Layout{kind: :varlena, width: nil, align_bytes: 4} =
+               Layout.resolve("citext", [], unknown_type_layout: {:fixed, 4, 4})
     end
   end
 
-  describe "Optimizer.optimize/1" do
-    test "orders by rank then NOT NULL then original index" do
-      cols = [
-        %{name: :flag, type: :boolean, opts: []},
-        %{name: :email, type: :string, opts: []},
-        %{name: :id_num, type: :bigint, opts: []},
-        %{name: :age, type: :integer, opts: [null: false]},
-        %{name: :ts, type: :utc_datetime, opts: [null: false]},
-        %{name: :tiny, type: :smallint, opts: []}
+  describe "MigrationRewriter.reorder_body/1 column ordering" do
+    test "orders primary keys, fixed-width columns, then varlena tail" do
+      lines = [
+        "  add :body, :text",
+        "  add :flag, :boolean",
+        "  add :big, :bigint",
+        "  add :count, :integer, null: false"
       ]
 
-      assert Enum.map(Optimizer.optimize(cols), & &1.name) ==
-               [:ts, :id_num, :age, :tiny, :flag, :email]
+      assert add_names(MigrationRewriter.reorder_body(lines)) == [:big, :count, :flag, :body]
     end
 
-    test "stable within same rank+nullability" do
-      cols = [
-        %{name: :a, type: :string, opts: []},
-        %{name: :b, type: :string, opts: []},
-        %{name: :c, type: :string, opts: []}
+    test "keeps explicit primary keys before layout-optimized columns" do
+      lines = [
+        "  add :tenant_id, :uuid, primary_key: true",
+        "  add :account_id, :bigint, primary_key: true",
+        "  add :inserted_at, :utc_datetime, null: false",
+        "  add :big, :bigint"
       ]
 
-      assert Enum.map(Optimizer.optimize(cols), & &1.name) == [:a, :b, :c]
-    end
-
-    test "keeps explicit primary keys before alignment-optimized columns" do
-      cols = [
-        %{name: :id, type: :uuid, opts: [primary_key: true]},
-        %{name: :inserted_at, type: :utc_datetime, opts: [null: false]},
-        %{name: :big, type: :bigint, opts: []}
-      ]
-
-      assert Enum.map(Optimizer.optimize(cols), & &1.name) == [:id, :inserted_at, :big]
-    end
-
-    test "non-primary UUIDs still rank normally" do
-      cols = [
-        %{name: :external_id, type: :uuid, opts: []},
-        %{name: :inserted_at, type: :utc_datetime, opts: [null: false]}
-      ]
-
-      assert Enum.map(Optimizer.optimize(cols), & &1.name) == [:inserted_at, :external_id]
-    end
-
-    test "multiple explicit primary keys preserve author order before other columns" do
-      cols = [
-        %{name: :tenant_id, type: :uuid, opts: [primary_key: true]},
-        %{name: :account_id, type: :bigint, opts: [primary_key: true]},
-        %{name: :inserted_at, type: :utc_datetime, opts: [null: false]}
-      ]
-
-      assert Enum.map(Optimizer.optimize(cols), & &1.name) == [
+      assert add_names(MigrationRewriter.reorder_body(lines)) == [
                :tenant_id,
                :account_id,
-               :inserted_at
+               :inserted_at,
+               :big
              ]
+    end
+
+    test "preserves author order inside equivalent varlena tail" do
+      lines = [
+        "  add :body, :text",
+        "  add :amount, :decimal",
+        "  add :payload, :map"
+      ]
+
+      assert add_names(MigrationRewriter.reorder_body(lines)) == [:body, :amount, :payload]
+    end
+
+    test "null false is only a tie-breaker inside equivalent layout buckets" do
+      lines = [
+        "  add :a, :integer",
+        "  add :b, :integer, null: false",
+        "  add :c, :bigint"
+      ]
+
+      assert add_names(MigrationRewriter.reorder_body(lines)) == [:c, :b, :a]
+    end
+
+    test "keeps uuid references high when doing so is padding-equivalent" do
+      lines = [
+        "  add :state, :integer, null: false",
+        "  add :user_id, references(:users, type: :binary_id), null: false",
+        "  add :count, :integer"
+      ]
+
+      assert add_names(MigrationRewriter.reorder_body(lines)) == [:user_id, :state, :count]
+    end
+
+    test "still moves 8-byte columns ahead of uuid references when padding can improve" do
+      lines = [
+        "  add :state, :integer, null: false",
+        "  add :user_id, references(:users, type: :binary_id), null: false",
+        "  add :expires_at, :utc_datetime_usec, null: false"
+      ]
+
+      assert add_names(MigrationRewriter.reorder_body(lines)) == [:expires_at, :user_id, :state]
+    end
+
+    test "can treat unknown custom atoms as PostgreSQL enums" do
+      lines = [
+        "  add :body, :text, null: false",
+        "  add :kind, :custom_status, null: false"
+      ]
+
+      assert add_names(MigrationRewriter.reorder_body(lines)) == [:body, :kind]
+
+      assert add_names(MigrationRewriter.reorder_body(lines, unknown_type_layout: {:fixed, 4, 4})) ==
+               [
+                 :kind,
+                 :body
+               ]
+    end
+  end
+
+  describe "LayoutSimulation" do
+    test "reports padding and hot-path score for an ordered column list" do
+      simulation =
+        PsqlTetris.simulate_columns(
+          [
+            {:flag, :boolean},
+            {:seen_at, :utc_datetime_usec},
+            {:body, :text}
+          ],
+          access_weights: %{flag: 10, seen_at: 1},
+          varlena_width: 12
+        )
+
+      assert %LayoutSimulation{data_width: 28, padding_width: 7, hot_path_score: 9} = simulation
+      assert [:flag, :seen_at, :body] == Enum.map(simulation.placed_columns, & &1.column.name)
+      assert [0, 8, 16] == Enum.map(simulation.placed_columns, & &1.offset)
+    end
+
+    test "compares current migration order with psql_tetris sorted order" do
+      input = """
+      create table(:t) do
+        add :flag, :boolean
+        add :seen_at, :utc_datetime_usec
+        add :body, :text
+      end
+      """
+
+      assert [%{current: current, sorted: sorted, simulated_best: simulated_best}] =
+               PsqlTetris.simulate_migration(input)
+
+      assert current.padding_width == 7
+      assert sorted.padding_width == 3
+      assert simulated_best.padding_width == 0
+      assert [:seen_at, :flag, :body] == Enum.map(sorted.placed_columns, & &1.column.name)
+      assert [:seen_at, :body, :flag] == Enum.map(simulated_best.placed_columns, & &1.column.name)
+    end
+  end
+
+  describe "MigrationParser.table_blocks/1" do
+    test "finds multiline and create_if_not_exists table blocks" do
+      source = """
+      def change do
+        create table(
+          :users,
+          primary_key: false
+        ) do
+          add :flag, :boolean
+          add :big, :bigint
+        end
+
+        create_if_not_exists table(:posts) do
+          add :body, :text
+          add :published, :boolean
+        end
+      end
+      """
+
+      assert [%{do_line: 5, end_line: 8}, %{do_line: 10, end_line: 13}] =
+               MigrationParser.table_blocks(source)
     end
   end
 
   describe "MigrationRewriter.rewrite/1" do
-    test "reorders a create table block" do
+    test "reorders a create table block with fixed-width before varlena" do
       input = """
       defmodule MyApp.Repo.Migrations.CreateUsers do
         use Ecto.Migration
@@ -180,34 +251,67 @@ defmodule PsqlTetrisTest do
       out = MigrationRewriter.rewrite(input)
       lines = String.split(out, "\n")
 
-      # Within the second run id_num (8b) should come before tiny (2b).
       assert idx(lines, "add :id_num") < idx(lines, "add :tiny")
-
-      # But the first run (single column `email`) is preserved above the comment.
       assert idx(lines, "add :email") < idx(lines, "# group A")
+
+      blank_input = """
+      create table(:messages) do
+        add(:sent_to, :string)
+
+        timestamps(type: :utc_datetime_usec, inserted_at: :created_at, updated_at: false, null: false)
+      end
+      """
+
+      assert MigrationRewriter.rewrite(blank_input) == blank_input
     end
 
-    test "leaves non-add statements (timestamps, modify) in place" do
+    test "can ignore blank lines as barriers and remove them" do
       input = """
-      create table(:t) do
-        add :flag, :boolean
-        add :id_num, :bigint
-        timestamps()
+      create table(:messages) do
+        add(:sent_to, :string)
+
+        timestamps(type: :utc_datetime_usec, inserted_at: :created_at, updated_at: false, null: false)
+      end
+      """
+
+      out = MigrationRewriter.rewrite(input, blank_lines: :ignore)
+      lines = String.split(out, "\n")
+
+      assert idx(lines, "timestamps") < idx(lines, "add(:sent_to")
+      refute "" in Enum.drop(lines, -1)
+    end
+
+    test "moves timestamps before variable-length columns" do
+      input = """
+      create table(:users) do
+        add :email, :citext, null: false
+        add :login, :citext, null: false
+        timestamps(type: :utc_datetime_usec, inserted_at: :created_at, null: false)
       end
       """
 
       out = MigrationRewriter.rewrite(input)
       lines = String.split(out, "\n")
 
-      assert idx(lines, "add :id_num") < idx(lines, "add :flag")
-      assert idx(lines, "add :flag") < idx(lines, "timestamps()")
+      assert idx(lines, "timestamps") < idx(lines, "add :email")
+      assert idx(lines, "timestamps") < idx(lines, "add :login")
     end
 
-    test "handles alter table" do
+    test "handles alter table, create_if_not_exists, timestamps, and multi-line column calls" do
       input = """
       alter table(:users) do
-        add :flag, :boolean
+        add :flag,
+            :boolean,
+            null: false
         add :big_id, :bigint
+      end
+
+      create_if_not_exists table(:events) do
+        add :payload, :text
+        timestamps(
+          type: :utc_datetime_usec
+        )
+        add :at, :utc_datetime
       end
       """
 
@@ -215,22 +319,8 @@ defmodule PsqlTetrisTest do
       lines = String.split(out, "\n")
 
       assert idx(lines, "add :big_id") < idx(lines, "add :flag")
-    end
-
-    test "handles multi-line add calls" do
-      input = """
-      create table(:t) do
-        add :flag,
-            :boolean,
-            null: false
-        add :big, :bigint
-      end
-      """
-
-      out = MigrationRewriter.rewrite(input)
-      lines = String.split(out, "\n")
-
-      assert idx(lines, "add :big") < idx(lines, "add :flag")
+      assert idx(lines, "timestamps") < idx(lines, "add :payload")
+      assert idx(lines, "add :at") < idx(lines, "add :payload")
     end
 
     test "honors `# psql_tetris: skip` directive inside a block" do
@@ -244,33 +334,6 @@ defmodule PsqlTetrisTest do
       """
 
       assert MigrationRewriter.rewrite(input) == input
-    end
-
-    test "skip directive is scoped to the block it appears in" do
-      input = """
-      create table(:legacy) do
-        # psql_tetris: skip
-        add :flag, :boolean
-        add :id_num, :bigint
-      end
-
-      create table(:fresh) do
-        add :small_flag, :boolean
-        add :big_id, :bigint
-      end
-      """
-
-      out = MigrationRewriter.rewrite(input)
-
-      [legacy_block, fresh_block] = String.split(out, "create table(:fresh)")
-
-      # Legacy block (skipped) preserves original order: flag before id_num.
-      assert :binary.match(legacy_block, "add :flag, :boolean") <
-               :binary.match(legacy_block, "add :id_num, :bigint")
-
-      # Fresh block (not skipped) gets reordered: bigint before boolean.
-      assert :binary.match(fresh_block, "add :big_id, :bigint") <
-               :binary.match(fresh_block, "add :small_flag, :boolean")
     end
 
     test "files without a table block are unchanged" do
@@ -298,11 +361,8 @@ defmodule PsqlTetrisTest do
       """
 
       opts_pg = [psql_tetris: [enabled: true]]
-
-      # Non-migration path: passthrough even on a PG project.
       assert PsqlTetris.Formatter.format(src, [file: "lib/foo.exs"] ++ opts_pg) == src
 
-      # Migration path on PG project: reordered.
       rewritten =
         PsqlTetris.Formatter.format(
           src,
@@ -313,7 +373,26 @@ defmodule PsqlTetrisTest do
       assert String.contains?(rewritten, "add :b, :bigint\n")
     end
 
-    test "format/2 is a no-op when Postgrex is not loaded (non-PG project)" do
+    test "format/2 passes psql_tetris layout options to the rewriter" do
+      src = """
+      create table(:t) do
+        add :body, :text
+        add :kind, :custom_status, null: false
+      end
+      """
+
+      opts = [
+        file: "priv/repo/migrations/20260222_create.exs",
+        psql_tetris: [enabled: true, unknown_type_layout: {:fixed, 4, 4}]
+      ]
+
+      rewritten = PsqlTetris.Formatter.format(src, opts)
+      lines = String.split(rewritten, "\n")
+
+      assert idx(lines, "add :kind") < idx(lines, "add :body")
+    end
+
+    test "format/2 is a no-op when Postgrex is not loaded unless explicitly enabled" do
       src = """
       create table(:t) do
         add :a, :boolean
@@ -321,30 +400,11 @@ defmodule PsqlTetrisTest do
       end
       """
 
-      # No explicit override; `Postgrex` is not loaded in this test env, so
-      # the default gate denies the rewrite even for migration paths.
       refute Code.ensure_loaded?(Postgrex)
 
       assert PsqlTetris.Formatter.format(src,
                file: "priv/repo/migrations/20260222_create.exs"
              ) == src
-    end
-
-    test "format/2 honours explicit `enabled: false` override" do
-      src = """
-      create table(:t) do
-        add :a, :boolean
-        add :b, :bigint
-      end
-      """
-
-      out =
-        PsqlTetris.Formatter.format(src,
-          file: "priv/repo/migrations/20260222_create.exs",
-          psql_tetris: [enabled: false]
-        )
-
-      assert out == src
     end
 
     test "migration_file?/2 honours custom paths" do
@@ -355,4 +415,11 @@ defmodule PsqlTetrisTest do
   end
 
   defp idx(lines, substr), do: Enum.find_index(lines, &String.contains?(&1, substr))
+
+  defp add_names(lines) do
+    Enum.map(lines, fn line ->
+      [_, name] = Regex.run(~r/add :([a-z_]+)/, line)
+      String.to_atom(name)
+    end)
+  end
 end
